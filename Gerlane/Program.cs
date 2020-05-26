@@ -105,7 +105,6 @@ namespace Gerlane
                 {
                     grupo.AsParallel().ForAll(item =>
                     {
-                        ShowGetPercent(ref total, ref step, item.Id);
 
                         try
                         {
@@ -116,6 +115,10 @@ namespace Gerlane
                             Console.WriteLine(ex.Message);
                             Console.WriteLine(ex.InnerException?.Message);
                             throw ex;
+                        }
+                        finally
+                        {
+                            ShowGetPercent(ref total, ref step, item.Accension);
                         }
 
 
@@ -241,14 +244,16 @@ namespace Gerlane
             {
                 exceptTime++;
 
+                var itemCode = !string.IsNullOrWhiteSpace(item.Accension) ? item.Accension : item.Id;
+
                 Console.WriteLine();
-                Console.WriteLine($"Falha na tentativa {exceptTime} do item {item.Id}");
+                Console.WriteLine($"Falha na tentativa {exceptTime} do item {itemCode}");
                 Console.WriteLine($"Motivo: {ex.GetFullMessage()}");
 
                 if (exceptTime >= 30)
                     throw ex;
 
-                Console.WriteLine($"Tentando novamente GI {item.Id}");
+                Console.WriteLine($"Tentando novamente {itemCode}");
                 await RequestAndSaveItem(item, arquivoSaida, exceptTime);
 
             }
@@ -317,7 +322,7 @@ namespace Gerlane
             return grupo;
         }
 
-        private void ShowGetPercent(ref int total, ref int step, string giNumber)
+        private void ShowGetPercent(ref int total, ref int step, string accesionNumber)
         {
             lock (lockPerc)
             {
@@ -325,7 +330,7 @@ namespace Gerlane
                 var perc = (((decimal)step) / total) * 100m;
                 perc = Math.Truncate(perc);
 
-                WriteSameLine($"Obtendo dados do GI number {giNumber}: {step}/{total} ({perc}%)");
+                WriteSameLine($"Dados do {accesionNumber} obtidos: {step}/{total} ({perc}%)");
             }
         }
 
@@ -417,7 +422,6 @@ namespace Gerlane
 
     public class Item
     {
-        //public int Indice { get; set; }
         public string Accension { get; set; }
         public string Id { get; set; }
         public string CollectionDate { get; set; }
@@ -435,11 +439,11 @@ namespace Gerlane
             Exception ex = source.InnerException;
             while (ex != null)
             {
-                msg += ex.Message.Trim() + Environment.NewLine;
+                msg += " " + ex.Message.Trim();
                 ex = ex.InnerException;
             }
 
-            return msg;
+            return msg + Environment.NewLine;
         }
     }
 }
