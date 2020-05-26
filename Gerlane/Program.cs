@@ -26,11 +26,7 @@ namespace Gerlane
 
             Console.CancelKeyPress += delegate
             {
-                foreach (var fs in streamFiles.Values)
-                {
-                    fs.Flush();
-                    fs.Close();
-                }
+                p.FlushAll();
 
                 Environment.Exit(0);
             };
@@ -41,9 +37,19 @@ namespace Gerlane
             }
             finally
             {
+                p.FlushAll();
                 Console.WriteLine();
                 Console.WriteLine("Processamento finalizado");
                 Console.ReadLine();
+            }
+        }
+
+        private void FlushAll()
+        {
+            foreach (var fs in streamFiles.Values)
+            {
+                fs.Flush();
+                fs.Close();
             }
         }
 
@@ -69,7 +75,7 @@ namespace Gerlane
 
                 var arquivoSaida = ObterNomeArquivoSaida(arquivo);
 
-                streamFiles.Add(arquivoSaida, File.OpenWrite(arquivoSaida));
+                streamFiles.Add(arquivoSaida, new FileStream(arquivoSaida, FileMode.Append));
 
                 var gruposAccNum = AgruparPorQuantidade(ret_max, linhas);
 
@@ -80,46 +86,14 @@ namespace Gerlane
                 for (int i = 0; i < gruposAccNum.Count(); i++)
                 {
                     var grupoAccNum = gruposAccNum.ElementAt(i);
-                    using (var client = new HttpClient())
-                    {
-                        ConfigureHttpClient(client);
 
-                        var strkeys = grupoAccNum.Select(x => x + "[accn]").Aggregate((x1, x2) => x1 + "+OR+" + x2);
-                        var url = $"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=nuccore&term={strkeys}&usehistory=y&retmax={ret_max}";
-                        var response = await client.GetAsync(url);
-                        if (!response.IsSuccessStatusCode)
-                        {
-                            Console.WriteLine($"Interation {i} : retornou erro {response.StatusCode} - {response.ReasonPhrase}");
-                            Console.ReadLine();
-                            throw new Exception(response.ReasonPhrase);
-                        }
+                    var index = (i * ret_max) + grupoAccNum.Count();
 
-                        var body = await response.Content.ReadAsStringAsync();
+                    items.AddRange(await RequestAndTranslateGINumber(grupoAccNum));
 
-                        XmlDocument doc = new XmlDocument();
-                        doc.PreserveWhitespace = false;
-                        doc.LoadXml(body);
-
-                        var elementListaId = doc.GetElementsByTagName("IdList")[0].ChildNodes;
-                        for (int g = 0; g < elementListaId.Count; g++)
-                        {
-                            var index = (i * ret_max) + g;
-
-                            var id = elementListaId.Item(g).InnerText;
-
-                            items.Add(new Item
-                            {
-                                Indice = index,
-                                Id = id
-                            });
-
-                            var perc = (((decimal)index) / total) * 100m;
-                            perc = Math.Truncate(perc);
-                            WriteSameLine($"Obtendo GIs dos accession numbers: {index + 1}/{total} ({perc}%)");
-                        }
-
-                    }
-
+                    var perc = (((decimal)index) / total) * 100m;
+                    perc = Math.Truncate(perc);
+                    WriteSameLine($"Obtidos GIs dos accession numbers: {index}/{total} ({perc}%)");
                 }
 
                 Console.WriteLine();
@@ -150,6 +124,63 @@ namespace Gerlane
 
                 Console.WriteLine();
                 Console.WriteLine($"Processamento do arquivo '{arquivo}' finalizado!");
+            }
+        }
+
+        private async Task<IEnumerable<Item>> RequestAndTranslateGINumber(IEnumerable<string> accessions, int exceptTime = 0)
+        {
+            try
+            {
+                using (var client = new HttpClient())
+                {
+                    ConfigureHttpClient(client);
+
+                    var strkeys = accessions.Select(x => x + "[accn]").Aggregate((x1, x2) => x1 + "+OR+" + x2);
+                    var url = $"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=nuccore&term={strkeys}&usehistory=y&retmax={ret_max}";
+                    var response = await client.GetAsync(url);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine($"Retornou erro {response.StatusCode} - {response.ReasonPhrase}");
+                        Console.ReadLine();
+                        throw new Exception(response.ReasonPhrase);
+                    }
+
+                    var body = await response.Content.ReadAsStringAsync();
+
+                    XmlDocument doc = new XmlDocument();
+                    doc.PreserveWhitespace = false;
+                    doc.LoadXml(body);
+
+                    var items = new List<Item>();
+
+                    var elementListaId = doc.GetElementsByTagName("IdList")[0].ChildNodes;
+                    for (int g = 0; g < elementListaId.Count; g++)
+                    {
+                        var id = elementListaId.Item(g).InnerText;
+
+                        items.Add(new Item
+                        {
+                            Id = id
+                        });
+                    }
+
+                    return items;
+
+                }
+            }
+            catch (Exception ex)
+            {
+                exceptTime++;
+
+                Console.WriteLine();
+                Console.WriteLine($"Falha ao obter numeros GI (Tentativa {exceptTime})");
+                Console.WriteLine($"Motivo: {ex.GetFullMessage()}");
+
+                if (exceptTime >= 30)
+                    throw ex;
+
+                Console.WriteLine($"Tentando novamente");
+                return await RequestAndTranslateGINumber(accessions, exceptTime);
             }
         }
 
@@ -212,7 +243,7 @@ namespace Gerlane
 
                 Console.WriteLine();
                 Console.WriteLine($"Falha na tentativa {exceptTime} do item {item.Id}");
-                Console.WriteLine($"Motivo: {ex.Message}");
+                Console.WriteLine($"Motivo: {ex.GetFullMessage()}");
 
                 if (exceptTime >= 30)
                     throw ex;
@@ -341,9 +372,28 @@ namespace Gerlane
             return linhas;
         }
 
+        private string ObterDiretorioBasePadrao()
+        {
+            var def = @"C:\temp";
+            var prevfile = Path.Combine(Environment.CurrentDirectory, "defaultDir.txt");
+
+            if (File.Exists(prevfile))
+                def = File.ReadAllText(prevfile).Trim();
+
+            return def;
+        }
+
+        private void SalvarDiretorioBasePadrao(string content)
+        {
+            var prevfile = Path.Combine(Environment.CurrentDirectory, "defaultDir.txt");
+
+
+            File.WriteAllText(prevfile, content.Trim());
+        }
+
         public IEnumerable<string> FindFiles()
         {
-            var diretorioBaseDef = @"C:\temp";
+            var diretorioBaseDef = ObterDiretorioBasePadrao();
 
             Console.Write($"Informe o diretório dos arquivos .csv [{diretorioBaseDef}]: ");
             var diretorioBase = Console.ReadLine();
@@ -356,6 +406,7 @@ namespace Gerlane
 
             diretorioBase = !string.IsNullOrWhiteSpace(diretorioBase) ? diretorioBase : diretorioBaseDef;
 
+            SalvarDiretorioBasePadrao(diretorioBase);
 
             return Directory
                 .GetFiles(diretorioBase, "*.csv", SearchOption.AllDirectories)
@@ -366,7 +417,7 @@ namespace Gerlane
 
     public class Item
     {
-        public int Indice { get; set; }
+        //public int Indice { get; set; }
         public string Accension { get; set; }
         public string Id { get; set; }
         public string CollectionDate { get; set; }
@@ -374,5 +425,21 @@ namespace Gerlane
         public string Country { get; set; }
         public string Region { get; set; }
         public string StrainIsolate { get; set; }
+    }
+
+    public static class ExceptionExtension
+    {
+        public static string GetFullMessage(this Exception source)
+        {
+            var msg = source.Message;
+            Exception ex = source.InnerException;
+            while (ex != null)
+            {
+                msg += ex.Message.Trim() + Environment.NewLine;
+                ex = ex.InnerException;
+            }
+
+            return msg;
+        }
     }
 }
