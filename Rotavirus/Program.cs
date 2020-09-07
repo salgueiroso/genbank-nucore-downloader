@@ -2,11 +2,13 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Xml;
+using Knapcode.TorSharp;
 
 namespace Gerlane
 {
@@ -20,8 +22,24 @@ namespace Gerlane
         static readonly object lockPerc = new object();
         static readonly Dictionary<string, FileStream> streamFiles = new Dictionary<string, FileStream>();
 
+        static readonly TorSharpSettings settings = new TorSharpSettings
+        {
+            ZippedToolsDirectory = Path.Combine(Path.GetTempPath(), "TorZipped"),
+            ExtractedToolsDirectory = Path.Combine(Path.GetTempPath(), "TorExtracted"),
+            PrivoxyPort = 1337,
+            TorSocksPort = 1338,
+            TorControlPort = 1339,
+            TorControlPassword = "foobar"
+        };
+
+
+        static readonly TorSharpProxy proxy = new TorSharpProxy(settings);
+
         static async Task Main(string[] args)
         {
+
+            await new TorSharpToolFetcher(settings, new HttpClient()).FetchAsync();
+
             var p = new Program();
 
             Console.CancelKeyPress += delegate
@@ -62,6 +80,9 @@ namespace Gerlane
 
             var arquivos = FindFiles();
             Console.WriteLine($"{arquivos.Count()} arquivos encontrados:");
+
+            await proxy.ConfigureAndStartAsync();
+
             foreach (var arquivo in arquivos)
                 Console.WriteLine($"* {arquivo}");
 
@@ -132,15 +153,30 @@ namespace Gerlane
 
         private async Task<IEnumerable<Item>> RequestAndTranslateGINumber(IEnumerable<string> accessions, int exceptTime = 0)
         {
+            string body = "";
             try
             {
-                using (var client = new HttpClient())
+
+
+                var handler = new HttpClientHandler
                 {
+                    Proxy = new WebProxy(new Uri("http://localhost:" + settings.PrivoxyPort))
+                };
+
+                using (var client = new HttpClient(handler))
+                {
+
+
                     ConfigureHttpClient(client);
 
                     var strkeys = accessions.Select(x => x + "[accn]").Aggregate((x1, x2) => x1 + "+OR+" + x2);
                     var url = $"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=nuccore&term={strkeys}&usehistory=y&retmax={ret_max}";
+
+
                     var response = await client.GetAsync(url);
+
+                    var l = response.Content.Headers.ToList();
+
                     if (!response.IsSuccessStatusCode)
                     {
                         Console.WriteLine($"Retornou erro {response.StatusCode} - {response.ReasonPhrase}");
@@ -148,7 +184,7 @@ namespace Gerlane
                         throw new Exception(response.ReasonPhrase);
                     }
 
-                    var body = await response.Content.ReadAsStringAsync();
+                    body = await response.Content.ReadAsStringAsync();
 
                     XmlDocument doc = new XmlDocument();
                     doc.PreserveWhitespace = false;
@@ -178,21 +214,29 @@ namespace Gerlane
                 Console.WriteLine();
                 Console.WriteLine($"Falha ao obter numeros GI (Tentativa {exceptTime})");
                 Console.WriteLine($"Motivo: {ex.GetFullMessage()}");
+                Console.WriteLine($"Dados retornados: {body}");
 
                 if (exceptTime >= 30)
                     throw ex;
 
+
                 Console.WriteLine($"Tentando novamente");
+                if (body?.Contains("blocked") == true)
+                    await proxy.GetNewIdentityAsync();
                 return await RequestAndTranslateGINumber(accessions, exceptTime);
             }
         }
 
         private async Task RequestAndSaveItem(Item item, string arquivoSaida, int exceptTime = 0)
         {
+            var body = "";
             try
             {
-
-                using (var client = new HttpClient())
+                var handler = new HttpClientHandler
+                {
+                    Proxy = new WebProxy(new Uri("http://localhost:" + settings.PrivoxyPort))
+                };
+                using (var client = new HttpClient(handler))
                 {
                     ConfigureHttpClient(client);
                     var response = await client.GetAsync($"https://www.ncbi.nlm.nih.gov/sviewer/viewer.fcgi?id={item.Id}&db=nuccore&report=genbank&conwithfeat=on&hide-cdd=on&retmode=txt&withmarkup=on&tool=portal&log$=seqview&maxdownloadsize=1000000");
@@ -203,7 +247,7 @@ namespace Gerlane
                         throw new Exception(response.ReasonPhrase);
                     }
 
-                    var body = await response.Content.ReadAsStringAsync();
+                    body = await response.Content.ReadAsStringAsync();
 
                     var accessionMatch = Regex.Match(body, "ACCESSION +(.+)");
                     if (accessionMatch.Success)
@@ -254,6 +298,8 @@ namespace Gerlane
                     throw ex;
 
                 Console.WriteLine($"Tentando novamente {itemCode}");
+                if (body?.Contains("blocked") == true)
+                    await proxy.GetNewIdentityAsync();
                 await RequestAndSaveItem(item, arquivoSaida, exceptTime);
 
             }
@@ -297,7 +343,16 @@ namespace Gerlane
                 {"to", "Tocantins" }
             };
 
-            dict.TryGetValue(uf, out var estado);
+            if (!dict.TryGetValue(uf, out var estado))
+            {
+                var ufMatch = Regex.Match(dado, "BRA/(.{2})");
+                if (ufMatch.Success)
+                {
+                    var extraido = ufMatch.Groups[1].Value.Trim().ToLower();
+
+                    dict.TryGetValue(extraido, out estado);
+                }
+            }
 
             return estado;
         }
@@ -338,7 +393,8 @@ namespace Gerlane
         {
             lock (streamFiles[arquivoSaida])
             {
-                var bytes = new UTF8Encoding(true).GetBytes(content.Trim() + Environment.NewLine);
+                var bytes = Encoding.Default.GetBytes(content.Trim() + Environment.NewLine);
+                //var bytes = new UTF8Encoding(true).GetBytes(content.Trim() + Environment.NewLine);
 
                 var fs = streamFiles[arquivoSaida];
                 fs.Write(bytes, 0, bytes.Count());
@@ -358,8 +414,9 @@ namespace Gerlane
 
         private void ConfigureHttpClient(HttpClient client)
         {
-            client.Timeout = TimeSpan.FromSeconds(5);
-            client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36");
+            client.Timeout = TimeSpan.FromSeconds(30);
+            var fkV = new Random().Next(DateTime.Now.Millisecond);
+            client.DefaultRequestHeaders.Add("User-Agent", $"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36 Aplubinho/{fkV}");
         }
 
         private IEnumerable<string> CarregarLinhasPendentes(string arquivo)
@@ -419,6 +476,8 @@ namespace Gerlane
                 .ToList();
         }
     }
+
+
 
     public class Item
     {
